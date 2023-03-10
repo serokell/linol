@@ -1,4 +1,3 @@
-
 open Sigs
 
 (** Current state of a document. *)
@@ -31,18 +30,30 @@ module Make(IO : IO) = struct
   module DiagnosticSeverity = DiagnosticSeverity
   module Req_id = Req_id
 
+  (** A variant carrying a [Lsp.Server_request.t] and a handler for its return
+      value. The request is stored in order to allow us to discriminate its
+      existential variable. *)
+  type server_request_handler_pair =
+    | Request_and_handler : 'from_server Lsp.Server_request.t * ('from_server -> unit IO.t) -> server_request_handler_pair
+
+  (** The type of the action that sends a request from the server to the client
+      and handles its response. *)
+  type send_request = server_request_handler_pair -> Req_id.t IO.t
+
   (** The server baseclass *)
   class virtual base_server = object
     method virtual on_notification :
       notify_back:(Lsp.Server_notification.t -> unit IO.t) ->
+      server_request:send_request ->
       Lsp.Client_notification.t ->
       unit IO.t
 
-    method virtual on_request : 'a.
+    method virtual on_request : 'from_client.
       notify_back:(Lsp.Server_notification.t -> unit IO.t) ->
+      server_request:send_request ->
       id:Req_id.t ->
-      'a Lsp.Client_request.t ->
-      'a IO.t
+      'from_client Lsp.Client_request.t ->
+      'from_client IO.t
     (** Method called to handle client requests.
         @param notify_back an object used to reply to the client, send progress
         messages, diagnostics, etc.
@@ -53,7 +64,7 @@ module Make(IO : IO) = struct
   end
 
   (** A wrapper to more easily reply to notifications *)
-  class notify_back ~notify_back ?version ?(uri:DocumentUri.t option) () = object
+  class notify_back ~notify_back ~server_request ?version ?(uri:DocumentUri.t option) () = object
     val mutable uri = uri
     method set_uri u = uri <- Some u
 
@@ -71,9 +82,14 @@ module Make(IO : IO) = struct
             ~uri ?version ~diagnostics:l () in
         notify_back (Lsp.Server_notification.PublishDiagnostics params)
 
-    (** Send a notification (general purpose method) *)
+    (** Send a notification from the server to the client (general purpose method) *)
     method send_notification (n:Lsp.Server_notification.t) =
       notify_back n
+
+    (** Send a request from the server to the client (general purpose method) *)
+    method send_request : 'from_server. 'from_server Lsp.Server_request.t -> ('from_server -> unit IO.t) -> Req_id.t IO.t =
+     fun r h ->
+      server_request @@ Request_and_handler (r, h)
   end
 
   (** Current state of a document. *)
@@ -219,8 +235,13 @@ module Make(IO : IO) = struct
       IO.return None
 
     method on_request
-    : type r. notify_back:_ -> id:Req_id.t -> r Lsp.Client_request.t -> r IO.t
-    = fun ~notify_back ~id (r:_ Lsp.Client_request.t) ->
+    : type from_client.
+      notify_back:_ ->
+      server_request:_ ->
+      id:Req_id.t ->
+      from_client Lsp.Client_request.t ->
+      from_client IO.t
+    = fun ~notify_back ~server_request ~id (r : _ Lsp.Client_request.t) ->
       Log.debug (fun k->k "handle request[id=%s] <opaque>" (Req_id.to_string id));
 
       begin match r with
@@ -230,7 +251,7 @@ module Make(IO : IO) = struct
 
         | Lsp.Client_request.Initialize i ->
           Log.debug (fun k->k "req: initialize");
-          let notify_back = new notify_back ~notify_back () in
+          let notify_back = new notify_back ~notify_back ~server_request () in
           self#on_req_initialize ~notify_back i
 
         | Lsp.Client_request.TextDocumentHover { textDocument; position; workDoneToken } ->
@@ -240,7 +261,7 @@ module Make(IO : IO) = struct
           begin match Hashtbl.find_opt docs uri with
             | None -> IO.return None
             | Some doc_st ->
-              let notify_back = new notify_back ~uri ~notify_back () in
+              let notify_back = new notify_back ~uri ~notify_back ~server_request () in
               self#on_req_hover ~notify_back ~id ~uri ~pos:position ~workDoneToken doc_st
           end
 
@@ -252,7 +273,7 @@ module Make(IO : IO) = struct
           begin match Hashtbl.find_opt docs uri with
             | None -> IO.return None
             | Some doc_st ->
-              let notify_back = new notify_back ~uri ~notify_back () in
+              let notify_back = new notify_back ~uri ~notify_back ~server_request () in
               self#on_req_completion ~notify_back ~id ~uri
                 ~workDoneToken ~partialResultToken
                 ~pos:position ~ctx:context doc_st
@@ -262,7 +283,7 @@ module Make(IO : IO) = struct
           } ->
           let uri = textDocument.uri in
           Log.debug (fun k->k "req: definition '%s'" (DocumentUri.to_path uri));
-          let notify_back = new notify_back ~uri ~notify_back () in
+          let notify_back = new notify_back ~uri ~notify_back ~server_request () in
 
           begin match Hashtbl.find_opt docs uri with
             | None -> IO.return None
@@ -277,7 +298,7 @@ module Make(IO : IO) = struct
           } ->
           let uri = textDocument.uri in
           Log.debug (fun k->k "req: codelens '%s'" (DocumentUri.to_path uri));
-          let notify_back = new notify_back ~uri ~notify_back () in
+          let notify_back = new notify_back ~uri ~notify_back ~server_request () in
 
           begin match Hashtbl.find_opt docs uri with
             | None -> IO.return []
@@ -288,21 +309,21 @@ module Make(IO : IO) = struct
 
         | Lsp.Client_request.TextDocumentCodeLensResolve cl ->
           Log.debug (fun k->k "req: codelens resolve");
-          let notify_back = new notify_back ~notify_back () in
+          let notify_back = new notify_back ~notify_back ~server_request () in
           self#on_req_code_lens_resolve ~notify_back ~id cl
 
         | Lsp.Client_request.ExecuteCommand { command; arguments; workDoneToken } ->
           Log.debug (fun k->k "req: execute command '%s'" command);
-          let notify_back = new notify_back ~notify_back () in
+          let notify_back = new notify_back ~notify_back ~server_request () in
           self#on_req_execute_command ~notify_back ~id ~workDoneToken command arguments
 
         | Lsp.Client_request.DocumentSymbol { textDocument=d; workDoneToken; partialResultToken } ->
-          let notify_back = new notify_back ~notify_back () in
+          let notify_back = new notify_back ~notify_back ~server_request () in
           self#on_req_symbol ~notify_back ~id ~uri:d.uri
             ~workDoneToken ~partialResultToken ()
 
         | Lsp.Client_request.CodeAction a ->
-          let notify_back = new notify_back ~notify_back () in
+          let notify_back = new notify_back ~notify_back ~server_request () in
           self#on_req_code_action ~notify_back ~id a
         | Lsp.Client_request.CodeActionResolve _
         | Lsp.Client_request.LinkedEditingRange _
@@ -331,7 +352,7 @@ module Make(IO : IO) = struct
         | Lsp.Client_request.SemanticTokensFull _
         | Lsp.Client_request.SemanticTokensRange _
         | Lsp.Client_request.UnknownRequest _ ->
-          let notify_back = new notify_back ~notify_back () in
+          let notify_back = new notify_back ~notify_back ~server_request () in
           self#on_request_unhandled ~notify_back ~id r
       end
 
@@ -362,7 +383,7 @@ module Make(IO : IO) = struct
       IO.return ()
 
     method on_notification
-        ~notify_back (n:Lsp.Client_notification.t) : unit IO.t =
+        ~notify_back ~server_request (n:Lsp.Client_notification.t) : unit IO.t =
       let open Lsp.Types in
 
       begin match n with
@@ -370,7 +391,7 @@ module Make(IO : IO) = struct
             {DidOpenTextDocumentParams.textDocument=doc} ->
           Log.debug (fun k->k "notif: did open '%s'" (DocumentUri.to_path doc.uri));
           let notify_back =
-            new notify_back ~uri:doc.uri ~version:doc.version ~notify_back () in
+            new notify_back ~uri:doc.uri ~version:doc.version ~notify_back ~server_request () in
           let st = {
             uri=doc.uri; version=doc.version; content=doc.text;
             languageId=doc.languageId;
@@ -380,12 +401,12 @@ module Make(IO : IO) = struct
 
         | Lsp.Client_notification.TextDocumentDidClose {textDocument=doc} ->
           Log.debug (fun k->k "notif: did close '%s'" (DocumentUri.to_path doc.uri));
-          let notify_back = new notify_back ~uri:doc.uri ~notify_back () in
+          let notify_back = new notify_back ~uri:doc.uri ~notify_back ~server_request () in
           self#on_notif_doc_did_close ~notify_back doc
 
         | Lsp.Client_notification.TextDocumentDidChange {textDocument=doc; contentChanges=c} ->
           Log.debug (fun k->k "notif: did change '%s'" (DocumentUri.to_path doc.uri));
-          let notify_back = new notify_back ~uri:doc.uri ~notify_back () in
+          let notify_back = new notify_back ~uri:doc.uri ~notify_back ~server_request () in
 
           let old_doc =
             match Hashtbl.find_opt docs doc.uri with
@@ -436,7 +457,7 @@ module Make(IO : IO) = struct
         | Lsp.Client_notification.WorkDoneProgressCancel _
         | Lsp.Client_notification.SetTrace _
           ->
-          let notify_back = new notify_back ~notify_back () in
+          let notify_back = new notify_back ~notify_back ~server_request () in
           self#on_notification_unhandled ~notify_back n
       end
   end

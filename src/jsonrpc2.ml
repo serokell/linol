@@ -69,9 +69,17 @@ module Make(IO : IO)
     ic: IO.in_channel;
     oc: IO.out_channel;
     s: server;
+    mutable id_counter : int;
+    pending_responses : (Req_id.t, server_request_handler_pair) Hashtbl.t
   }
 
-  let create ~ic ~oc server : t = {ic; oc; s=server}
+  let create ~ic ~oc server : t =
+    { ic
+    ; oc
+    ; s = server
+    ; id_counter = 0
+    ; pending_responses = Hashtbl.create 8
+    }
 
   let create_stdio server : t =
     create ~ic:IO.stdin ~oc:IO.stdout server
@@ -93,6 +101,29 @@ module Make(IO : IO)
   let send_server_notif (self:t) (m:Jsonrpc.Message.notification) : unit IO.t =
     let json = Jsonrpc.Message.yojson_of_notification m in
     send_json_ self json
+
+  let send_server_req (self:t) (m:Jsonrpc.Message.request) : unit IO.t =
+    let json = Jsonrpc.Message.yojson_of_request m in
+    send_json_ self json
+
+  let fresh_lsp_id (self : t) : Req_id.t =
+    let id = self.id_counter in
+    self.id_counter <- id + 1;
+    `Int id
+
+  (** Registers a new handler for a request response. The return indicates
+      whether a value was inserted or not (in which case it's already present). *)
+  let register_server_request_response_handler
+      (self : t)
+      (id : Req_id.t)
+      (handler : server_request_handler_pair)
+      : bool =
+    let pending_responses = self.pending_responses in
+    if Hashtbl.mem pending_responses id then
+      false
+    else
+      let () = Hashtbl.add pending_responses id handler in
+      true
 
   let try_ f =
     IO.catch
@@ -148,8 +179,8 @@ module Make(IO : IO)
         Log.debug (fun k->k "got json %s" (J.to_string j));
         begin match Jsonrpc.Message.either_of_yojson j with
           | m -> IO.return @@ Ok m
-          | exception _ ->
-            Log.err (fun k->k "cannot decode json message");
+          | exception exn ->
+            Log.err (fun k->k "cannot decode json message: %s" (Printexc.to_string exn));
             IO.return (Error (E(ErrorCode.ParseError, "cannot decode json")))
         end
       | exception _ ->
@@ -175,6 +206,17 @@ module Make(IO : IO)
             in
             send_response self r)
       in
+      let server_request (req : server_request_handler_pair) : Req_id.t IO.t =
+        let Request_and_handler (r, _) = req in
+        let id = fresh_lsp_id self in
+        let msg = Lsp.Server_request.to_jsonrpc_request r ~id in
+        let has_inserted = register_server_request_response_handler self id req in
+        if has_inserted then
+          let* () = send_server_req self msg in
+          return id
+        else
+          IO.failwith "failed to register server request: id was already used"
+      in
       match r.M.id with
       | None ->
         (* notification *)
@@ -185,7 +227,8 @@ module Make(IO : IO)
                 (self.s)#on_notification n
                   ~notify_back:(fun n ->
                       let msg = Lsp.Server_notification.to_jsonrpc n in
-                      send_server_notif self msg))
+                      send_server_notif self msg)
+                  ~server_request)
               (fun e ->
                  let msg =
                    Lsp.Types.LogMessageParams.create ~type_:Lsp.Types.MessageType.Error
@@ -201,7 +244,7 @@ module Make(IO : IO)
         end
       | Some id ->
         (* request, so we need to reply *)
-        IO.catch
+        protect ~id
           (fun () ->
             begin match Lsp.Client_request.of_jsonrpc {r with M.id} with
               | Ok (Lsp.Client_request.E r) ->
@@ -210,6 +253,7 @@ module Make(IO : IO)
                     ~notify_back:(fun n ->
                         let msg = Lsp.Server_notification.to_jsonrpc n in
                         send_server_notif self msg)
+                    ~server_request
                   in
                   let reply_json = Lsp.Client_request.yojson_of_result r reply in
                   let response = Jsonrpc.Response.ok id reply_json in
@@ -218,16 +262,6 @@ module Make(IO : IO)
               | Error e ->
                 IO.failwith (spf "cannot decode request: %s" e)
             end)
-          (fun e ->
-            let message = spf "%s\n%s" (Printexc.to_string e) (Printexc.get_backtrace()) in
-            Log.err (fun k->k "error: %s" message);
-            let r =
-              Jsonrpc.Response.error id
-              (Jsonrpc.Response.Error.make
-                ~code:Jsonrpc.Response.Error.Code.InternalError
-                ~message ())
-            in
-            send_response self r)
     in
     let rec loop () =
       if shutdown() then IO.return ()
