@@ -276,12 +276,37 @@ module Make (IO : IO) : S with module IO = IO = struct
         (match Jsonrpc.Packet.t_of_yojson j with
         | m -> IO.return @@ Ok m
         | exception exn ->
-          Log.err (fun k ->
-              k "cannot decode json message: %s" (Printexc.to_string exn));
-          IO.return (Error (E (ErrorCode.ParseError, "cannot decode json"))))
+          (* Shutdown request has `Null in params, but Jsonrpc always waits `Structured.t`
+             for some reason, so we need to handle this manually *)
+          let parse_shutdown json =
+            let open J.Util in
+            match json with
+            | `Assoc _ as t
+              when t |> member "method" |> J.equal (`String "shutdown")
+                   && t |> member "params" |> J.equal `Null ->
+              Log.debug (fun k -> k "parsed a shutdown request");
+              Some
+                (Jsonrpc.Packet.Request
+                   {
+                     id =
+                       (match t |> member "id" with
+                       | `Int n -> `Int n
+                       | `String s -> `String s
+                       | _ -> `Int 0);
+                     method_ = "shutdown";
+                     params = None;
+                   })
+            | _ -> None
+          in
+          (match parse_shutdown j with
+          | Some r -> IO.return @@ Ok r
+          | None ->
+            Log.err (fun k ->
+                k "cannot decode json message: %s" (Printexc.to_string exn));
+            IO.return (Error (E (ErrorCode.ParseError, "cannot decode json")))))
       | exception _ ->
         IO.return
-        @@ Error (E (ErrorCode.ParseError, "missing content-length' header"))
+        @@ Error (E (ErrorCode.ParseError, "missing 'content-length' header"))
     ) else
       IO.return
       @@ Error (E (ErrorCode.InvalidRequest, "content-type must be 'utf-8'"))
